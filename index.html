@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Synergy Bookstore</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-50 min-h-screen">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef, createContext, useContext } = React;
+
+function compressImage(file, maxWidth = 600, quality = 0.78) {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) return reject(new Error('Not image'));
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const scale = Math.min(1, maxWidth / img.width);
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+const STORAGE_KEY = 'synergy_bookstore_v2';
+const loadState = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch { return null; } };
+const saveState = (s) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch (e) { alert('Хранилище переполнено'); } };
+
+const RENT_OPTIONS = [
+  { id: '2w', label: '2 недели', days: 14, multiplier: 0.15 },
+  { id: '1m', label: '1 месяц', days: 30, multiplier: 0.25 },
+  { id: '3m', label: '3 месяца', days: 90, multiplier: 0.55 },
+];
+
+const seedState = () => ({
+  users: [
+    { id: 1, username: 'admin', password: 'admin', role: 'admin' },
+    { id: 2, username: 'reader', password: '12345', role: 'user' },
+    { id: 3, username: 'maria', password: '12345', role: 'user' },
+  ],
+  books: [
+    { id: 1, title: 'Мастер и Маргарита', author: 'Михаил Булгаков', year: 1967, category: 'Классика', price: 450, cover: '📕', coverImg: null, status: 'in_stock', available: true, description: 'Знаменитый философский роман о визите дьявола в советскую Москву.' },
+    { id: 2, title: 'Чистый код', author: 'Роберт Мартин', year: 2008, category: 'IT', price: 1200, cover: '💻', coverImg: null, status: 'in_stock', available: true, description: 'Книга о принципах разработки качественного программного обеспечения.' },
+    { id: 3, title: '1984', author: 'Джордж Оруэлл', year: 1949, category: 'Антиутопия', price: 380, cover: '📘', coverImg: null, status: 'in_stock', available: true, description: 'Культовый роман-антиутопия о тоталитарном будущем.' },
+    { id: 4, title: 'Sapiens', author: 'Юваль Ной Харари', year: 2011, category: 'Научпоп', price: 690, cover: '📙', coverImg: null, status: 'in_stock', available: true, description: 'Краткая история человечества от древности до наших дней.' },
+    { id: 5, title: 'Алгоритмы', author: 'Томас Кормен', year: 2009, category: 'IT', price: 1850, cover: '📗', coverImg: null, status: 'in_stock', available: true, description: 'Фундаментальный учебник по алгоритмам и структурам данных.' },
+    { id: 6, title: 'Преступление и наказание', author: 'Фёдор Достоевский', year: 1866, category: 'Классика', price: 420, cover: '📕', coverImg: null, status: 'in_stock', available: true, description: 'Психологический роман о моральных терзаниях Раскольникова.' },
+  ],
+  transactions: [],
+  reviews: [], // { id, bookId, userId, rating, body, createdAt }
+  notifications: [],
+  nextId: { user: 4, book: 7, tx: 1, notif: 1, review: 1 },
+});
+
+const AppCtx = createContext(null);
+function AppProvider({ children }) {
+  const [state, setState] = useState(() => loadState() || seedState());
+  const [currentUserId, setCurrentUserId] = useState(() => {
+    const sid = localStorage.getItem('synergy_bookstore_session');
+    return sid ? Number(sid) : null;
+  });
+  useEffect(() => saveState(state), [state]);
+  useEffect(() => {
+    if (currentUserId) localStorage.setItem('synergy_bookstore_session', String(currentUserId));
+    else localStorage.removeItem('synergy_bookstore_session');
+  }, [currentUserId]);
+
+  // Generate "upcoming rental expiration" notifications on mount
+  useEffect(() => {
+    const now = Date.now();
+    const threeDays = 3 * 86400000;
+    setState(s => {
+      const newNotifs = [];
+      s.transactions.forEach(t => {
+        if (t.type !== 'rent' || t.returned) return;
+        if (t.endDate - now < threeDays && t.endDate > now) {
+          if (!s.notifications.some(n => n.txId === t.id && n.type === 'warning')) {
+            const book = s.books.find(b => b.id === t.bookId);
+            newNotifs.push({
+              id: s.nextId.notif + newNotifs.length,
+              userId: t.userId, txId: t.id, type: 'warning',
+              message: `Срок аренды книги «${book?.title}» истекает ${new Date(t.endDate).toLocaleDateString('ru-RU')}. Не забудьте вернуть!`,
+              createdAt: now, read: false,
+            });
+          }
+        }
+        if (t.endDate < now) {
+          if (!s.notifications.some(n => n.txId === t.id && n.type === 'expired')) {
+            const book = s.books.find(b => b.id === t.bookId);
+            newNotifs.push({
+              id: s.nextId.notif + newNotifs.length,
+              userId: t.userId, txId: t.id, type: 'expired',
+              message: `⚠ Срок аренды «${book?.title}» истёк. Пожалуйста, верните книгу.`,
+              createdAt: now, read: false,
+            });
+          }
+        }
+      });
+      return newNotifs.length === 0 ? s : { ...s, notifications: [...s.notifications, ...newNotifs], nextId: { ...s.nextId, notif: s.nextId.notif + newNotifs.length } };
+    });
+  }, []);
+
+  const currentUser = state.users.find(u => u.id === currentUserId) || null;
+
+  const api = {
+    state, currentUser,
+    register: (username, password) => {
+      if (state.users.some(u => u.username === username)) return { ok: false, error: 'Имя занято' };
+      const id = state.nextId.user;
+      setState(s => ({ ...s, users: [...s.users, { id, username, password, role: 'user' }], nextId: { ...s.nextId, user: id + 1 } }));
+      setCurrentUserId(id);
+      return { ok: true };
+    },
+    login: (username, password) => {
+      const u = state.users.find(u => u.username === username && u.password === password);
+      if (!u) return { ok: false, error: 'Неверные данные' };
+      setCurrentUserId(u.id);
+      return { ok: true };
+    },
+    logout: () => setCurrentUserId(null),
+    buyBook: (bookId) => {
+      const book = state.books.find(b => b.id === bookId);
+      if (!book) return;
+      const id = state.nextId.tx;
+      setState(s => ({ ...s, transactions: [...s.transactions, { id, userId: currentUserId, bookId, type: 'buy', totalPrice: book.price, startDate: Date.now(), endDate: null, returned: false }], nextId: { ...s.nextId, tx: id + 1 } }));
+    },
+    rentBook: (bookId, optId) => {
+      const book = state.books.find(b => b.id === bookId);
+      const opt = RENT_OPTIONS.find(o => o.id === optId);
+      if (!book || !opt) return;
+      const id = state.nextId.tx;
+      const start = Date.now();
+      setState(s => ({ ...s, transactions: [...s.transactions, { id, userId: currentUserId, bookId, type: 'rent', rentOption: opt.id, totalPrice: Math.round(book.price * opt.multiplier), startDate: start, endDate: start + opt.days * 86400000, returned: false }], nextId: { ...s.nextId, tx: id + 1 } }));
+    },
+    returnBook: (txId) => setState(s => ({ ...s, transactions: s.transactions.map(t => t.id === txId ? { ...t, returned: true } : t) })),
+    addBook: (book) => { const id = state.nextId.book; setState(s => ({ ...s, books: [...s.books, { ...book, id }], nextId: { ...s.nextId, book: id + 1 } })); },
+    updateBook: (id, fields) => setState(s => ({ ...s, books: s.books.map(b => b.id === id ? { ...b, ...fields } : b) })),
+    deleteBook: (id) => setState(s => ({ ...s, books: s.books.filter(b => b.id !== id) })),
+    addReview: (bookId, rating, body) => {
+      const id = state.nextId.review;
+      setState(s => ({ ...s, reviews: [...s.reviews.filter(r => !(r.bookId === bookId && r.userId === currentUserId)), { id, bookId, userId: currentUserId, rating, body, createdAt: Date.now() }], nextId: { ...s.nextId, review: id + 1 } }));
+    },
+    markNotifRead: (id) => setState(s => ({ ...s, notifications: s.notifications.map(n => n.id === id ? { ...n, read: true } : n) })),
+    resetDemo: () => { setState(seedState()); setCurrentUserId(null); },
+  };
+  return <AppCtx.Provider value={api}>{children}</AppCtx.Provider>;
+}
+const useApp = () => useContext(AppCtx);
+
+function Stars({ value, max = 5, onChange, size = 'text-base' }) {
+  return <span className="inline-flex">
+    {Array.from({ length: max }, (_, i) => (
+      <button key={i} type="button" disabled={!onChange} onClick={() => onChange && onChange(i + 1)}
+        className={`${size} ${i < value ? 'text-amber-500' : 'text-slate-300'} ${onChange ? 'hover:scale-110' : ''}`}>★</button>
+    ))}
+  </span>;
+}
+
+function Header({ tab, setTab }) {
+  const { currentUser, logout, state } = useApp();
+  const isAdmin = currentUser?.role === 'admin';
+  const unread = currentUser ? state.notifications.filter(n => n.userId === currentUser.id && !n.read).length : 0;
+  const tabs = [
+    { id: 'catalog', label: '📚 Каталог' },
+    ...(currentUser && !isAdmin ? [{ id: 'my', label: 'Моя библиотека' }] : []),
+    ...(isAdmin ? [
+      { id: 'admin-dashboard', label: 'Дашборд' },
+      { id: 'admin-books', label: 'Каталог' },
+      { id: 'admin-rentals', label: 'Аренды' },
+    ] : []),
+    ...(currentUser ? [{ id: 'notif', label: `🔔${unread ? ' ' + unread : ''}` }] : []),
+  ];
+  return (
+    <header className="bg-white shadow-sm border-b sticky top-0 z-10">
+      <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+        <div className="flex items-center gap-4 flex-wrap">
+          <h1 className="text-xl font-bold text-emerald-700">📖 Synergy Bookstore</h1>
+          <nav className="flex gap-1 flex-wrap">{tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className={`px-3 py-1.5 text-sm rounded-md ${tab === t.id ? 'bg-emerald-100 text-emerald-800 font-medium' : 'text-slate-600 hover:bg-slate-100'}`}>{t.label}</button>
+          ))}</nav>
+        </div>
+        <div className="text-sm">{currentUser ? <div className="flex items-center gap-3"><span className="text-slate-600">@{currentUser.username} {isAdmin && <span className="bg-red-100 text-red-700 text-xs px-1.5 rounded">admin</span>}</span><button onClick={logout} className="text-red-600 hover:underline">Выйти</button></div> : <button onClick={() => setTab('auth')} className="bg-emerald-600 text-white px-3 py-1.5 rounded-md text-sm">Войти</button>}</div>
+      </div>
+    </header>
+  );
+}
+
+function AuthScreen({ onDone }) {
+  const { register, login } = useApp();
+  const [mode, setMode] = useState('login');
+  const [u, setU] = useState(''); const [p, setP] = useState(''); const [err, setErr] = useState('');
+  const submit = (e) => { e.preventDefault(); const r = mode === 'login' ? login(u, p) : register(u, p); if (!r.ok) setErr(r.error); else { setErr(''); onDone(); } };
+  return <div className="max-w-md mx-auto mt-12 bg-white p-6 rounded-lg shadow-md">
+    <h2 className="text-2xl font-bold mb-1">{mode === 'login' ? 'Вход' : 'Регистрация'}</h2>
+    <p className="text-sm text-slate-500 mb-4">Демо: admin / admin или reader / 12345</p>
+    <form onSubmit={submit} className="space-y-3">
+      <input value={u} onChange={e => setU(e.target.value)} placeholder="Имя" className="w-full px-3 py-2 border rounded-md" />
+      <input type="password" value={p} onChange={e => setP(e.target.value)} placeholder="Пароль" className="w-full px-3 py-2 border rounded-md" />
+      {err && <p className="text-red-600 text-sm">{err}</p>}
+      <button className="w-full bg-emerald-600 text-white py-2 rounded-md">{mode === 'login' ? 'Войти' : 'Зарегистрироваться'}</button>
+    </form>
+    <button onClick={() => { setMode(mode === 'login' ? 'reg' : 'login'); setErr(''); }} className="mt-3 text-sm text-emerald-700 hover:underline">{mode === 'login' ? 'Создать аккаунт' : 'Уже есть аккаунт'}</button>
+  </div>;
+}
+
+function BookDetailModal({ book, onClose }) {
+  const { state, currentUser, buyBook, rentBook, addReview } = useApp();
+  const [showRent, setShowRent] = useState(false);
+  const [reviewRating, setReviewRating] = useState(5);
+  const [reviewBody, setReviewBody] = useState('');
+  const reviews = state.reviews.filter(r => r.bookId === book.id);
+  const avgRating = reviews.length === 0 ? 0 : reviews.reduce((s, r) => s + r.rating, 0) / reviews.length;
+  const myReview = currentUser && reviews.find(r => r.userId === currentUser.id);
+
+  return (
+    <div onClick={onClose} className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+      <div onClick={e => e.stopPropagation()} className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+        <div className="p-5">
+          <div className="flex justify-between items-start mb-3">
+            <h2 className="text-2xl font-bold">{book.title}</h2>
+            <button onClick={onClose} className="text-slate-400 text-2xl">×</button>
+          </div>
+          <div className="flex gap-4 mb-4">
+            {book.coverImg ? <img src={book.coverImg} className="w-32 h-44 object-cover rounded-md border" /> : <div className="w-32 h-44 bg-slate-100 flex items-center justify-center rounded-md border text-6xl">{book.cover}</div>}
+            <div className="flex-1">
+              <p className="text-slate-600">{book.author}, {book.year}</p>
+              <p className="text-xs text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded inline-block mt-1">{book.category}</p>
+              <p className="text-2xl font-bold mt-2">{book.price} ₽</p>
+              <div className="mt-2 flex items-center gap-2"><Stars value={Math.round(avgRating)} /> <span className="text-sm text-slate-500">{reviews.length} отзыв(ов)</span></div>
+              <p className="text-sm text-slate-700 mt-3">{book.description}</p>
+            </div>
+          </div>
+          {currentUser && currentUser.role === 'user' && book.available && (
+            <div className="bg-slate-50 p-3 rounded-md mb-3">
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={() => { buyBook(book.id); onClose(); }} className="bg-emerald-600 text-white px-4 py-2 rounded-md text-sm">Купить за {book.price} ₽</button>
+                {!showRent ? <button onClick={() => setShowRent(true)} className="bg-blue-100 text-blue-800 px-4 py-2 rounded-md text-sm">Арендовать</button>
+                  : <div className="flex gap-1 flex-wrap">{RENT_OPTIONS.map(o => (
+                    <button key={o.id} onClick={() => { rentBook(book.id, o.id); onClose(); }} className="bg-blue-50 text-blue-800 px-2 py-1 rounded text-xs">{o.label} — {Math.round(book.price * o.multiplier)} ₽</button>
+                  ))}</div>
+                }
+              </div>
+            </div>
+          )}
+          <div className="border-t pt-3">
+            <h3 className="font-bold mb-2">Отзывы ({reviews.length})</h3>
+            {currentUser && currentUser.role === 'user' && (
+              <div className="bg-slate-50 p-3 rounded-md mb-2">
+                <p className="text-sm font-medium mb-1">{myReview ? 'Ваш отзыв' : 'Оставить отзыв'}</p>
+                <Stars value={reviewRating} onChange={setReviewRating} />
+                <textarea value={reviewBody} onChange={e => setReviewBody(e.target.value)} rows={2} placeholder="Текст отзыва" className="w-full px-2 py-1 border rounded-md text-sm mt-1" />
+                <button onClick={() => { if (reviewBody.trim()) { addReview(book.id, reviewRating, reviewBody.trim()); setReviewBody(''); } }} className="bg-emerald-600 text-white px-3 py-1 rounded-md text-sm mt-1">{myReview ? 'Обновить' : 'Опубликовать'}</button>
+              </div>
+            )}
+            {reviews.length === 0 ? <p className="text-sm text-slate-500">Отзывов пока нет</p> : reviews.map(r => {
+              const u = state.users.find(u => u.id === r.userId);
+              return <div key={r.id} className="border-t py-2"><div className="flex justify-between"><span className="text-sm font-medium">@{u?.username}</span><Stars value={r.rating} /></div><p className="text-sm text-slate-700">{r.body}</p></div>;
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BookCard({ book, onClick }) {
+  const { state } = useApp();
+  const reviews = state.reviews.filter(r => r.bookId === book.id);
+  const avg = reviews.length === 0 ? 0 : reviews.reduce((s, r) => s + r.rating, 0) / reviews.length;
+  return (
+    <div onClick={onClick} className="bg-white p-3 rounded-lg shadow-sm border flex flex-col hover:shadow-md cursor-pointer transition">
+      {book.coverImg ? <img src={book.coverImg} className="w-full h-40 object-cover rounded-md mb-2" /> : <div className="text-5xl text-center py-4 bg-slate-50 rounded-md mb-2">{book.cover}</div>}
+      <h3 className="font-bold text-slate-800 text-sm leading-tight">{book.title}</h3>
+      <p className="text-xs text-slate-600">{book.author}, {book.year}</p>
+      <p className="text-xs text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded inline-block self-start mt-1">{book.category}</p>
+      <div className="mt-1"><Stars value={Math.round(avg)} size="text-xs" /> <span className="text-xs text-slate-500">({reviews.length})</span></div>
+      <p className="text-lg font-bold mt-1">{book.price} ₽</p>
+      <p className={`text-xs ${book.available ? 'text-green-600' : 'text-red-600'}`}>{book.available ? '✓ В наличии' : '✗ Недоступна'}</p>
+    </div>
+  );
+}
+
+function CatalogView() {
+  const { state } = useApp();
+  const [sortBy, setSortBy] = useState('title');
+  const [cat, setCat] = useState(''); const [auth, setAuth] = useState(''); const [year, setYear] = useState(''); const [q, setQ] = useState('');
+  const [selectedBook, setSelectedBook] = useState(null);
+
+  const categories = useMemo(() => Array.from(new Set(state.books.map(b => b.category))).sort(), [state.books]);
+  const authors = useMemo(() => Array.from(new Set(state.books.map(b => b.author))).sort(), [state.books]);
+  const years = useMemo(() => Array.from(new Set(state.books.map(b => b.year))).sort((a,b) => b-a), [state.books]);
+
+  const visible = useMemo(() => {
+    let list = state.books.filter(b => b.status === 'in_stock');
+    if (q) list = list.filter(b => (b.title + ' ' + b.author).toLowerCase().includes(q.toLowerCase()));
+    if (cat) list = list.filter(b => b.category === cat);
+    if (auth) list = list.filter(b => b.author === auth);
+    if (year) list = list.filter(b => String(b.year) === year);
+    const sorters = {
+      title: (a, b) => a.title.localeCompare(b.title),
+      author: (a, b) => a.author.localeCompare(b.author),
+      year_desc: (a, b) => b.year - a.year,
+      year_asc: (a, b) => a.year - b.year,
+      price_asc: (a, b) => a.price - b.price,
+      price_desc: (a, b) => b.price - a.price,
+      rating: (a, b) => {
+        const ra = state.reviews.filter(r => r.bookId === a.id);
+        const rb = state.reviews.filter(r => r.bookId === b.id);
+        const aa = ra.length === 0 ? 0 : ra.reduce((s, r) => s + r.rating, 0) / ra.length;
+        const ab = rb.length === 0 ? 0 : rb.reduce((s, r) => s + r.rating, 0) / rb.length;
+        return ab - aa;
+      },
+    };
+    return [...list].sort(sorters[sortBy]);
+  }, [state.books, state.reviews, q, cat, auth, year, sortBy]);
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white p-4 rounded-lg shadow-sm border grid md:grid-cols-5 gap-3">
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="🔍 Поиск..." className="px-3 py-1.5 border rounded-md text-sm md:col-span-2" />
+        <select value={cat} onChange={e => setCat(e.target.value)} className="px-3 py-1.5 border rounded-md text-sm"><option value="">Все категории</option>{categories.map(c => <option key={c}>{c}</option>)}</select>
+        <select value={auth} onChange={e => setAuth(e.target.value)} className="px-3 py-1.5 border rounded-md text-sm"><option value="">Все авторы</option>{authors.map(a => <option key={a}>{a}</option>)}</select>
+        <select value={year} onChange={e => setYear(e.target.value)} className="px-3 py-1.5 border rounded-md text-sm"><option value="">Все годы</option>{years.map(y => <option key={y}>{y}</option>)}</select>
+        <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="px-3 py-1.5 border rounded-md text-sm md:col-span-5">
+          <option value="title">По названию</option><option value="author">по автору</option>
+          <option value="year_desc">год (новые)</option><option value="year_asc">год (старые)</option>
+          <option value="price_asc">цена ↑</option><option value="price_desc">цена ↓</option>
+          <option value="rating">по рейтингу</option>
+        </select>
+      </div>
+      <p className="text-sm text-slate-600">Найдено: {visible.length}</p>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+        {visible.map(b => <BookCard key={b.id} book={b} onClick={() => setSelectedBook(b)} />)}
+      </div>
+      {selectedBook && <BookDetailModal book={selectedBook} onClose={() => setSelectedBook(null)} />}
+    </div>
+  );
+}
+
+function MyLibraryView() {
+  const { state, currentUser, returnBook } = useApp();
+  const myTx = state.transactions.filter(t => t.userId === currentUser.id);
+  const purchases = myTx.filter(t => t.type === 'buy');
+  const rentals = myTx.filter(t => t.type === 'rent');
+  const fmt = (ts) => new Date(ts).toLocaleDateString('ru-RU');
+  const totalSpent = myTx.reduce((s, t) => s + t.totalPrice, 0);
+  return (
+    <div className="space-y-6">
+      <div className="bg-white p-4 rounded-lg shadow-sm border grid grid-cols-3 gap-3 text-center">
+        <div><p className="text-2xl font-bold text-emerald-700">{purchases.length}</p><p className="text-xs text-slate-500">куплено</p></div>
+        <div><p className="text-2xl font-bold text-blue-700">{rentals.filter(t => !t.returned).length}</p><p className="text-xs text-slate-500">активных аренд</p></div>
+        <div><p className="text-2xl font-bold text-slate-700">{totalSpent.toLocaleString('ru-RU')} ₽</p><p className="text-xs text-slate-500">всего потрачено</p></div>
+      </div>
+      <section>
+        <h2 className="text-xl font-bold mb-2">📚 Купленные книги ({purchases.length})</h2>
+        {purchases.length === 0 ? <p className="text-sm text-slate-500">Пока ничего не куплено</p> : <div className="grid md:grid-cols-2 gap-3">{purchases.map(t => { const b = state.books.find(b => b.id === t.bookId); return <div key={t.id} className="bg-white p-3 rounded-lg shadow-sm border flex gap-3 items-center">{b?.coverImg ? <img src={b.coverImg} className="w-12 h-16 object-cover rounded" /> : <div className="text-3xl">{b?.cover}</div>}<div><p className="font-bold">{b?.title}</p><p className="text-sm text-slate-600">{b?.author}</p><p className="text-xs text-slate-500">куплено: {fmt(t.startDate)} • {t.totalPrice} ₽</p></div></div>; })}</div>}
+      </section>
+      <section>
+        <h2 className="text-xl font-bold mb-2">🔄 Аренда ({rentals.length})</h2>
+        {rentals.length === 0 ? <p className="text-sm text-slate-500">Аренд нет</p> : <div className="grid md:grid-cols-2 gap-3">{rentals.map(t => { const b = state.books.find(b => b.id === t.bookId); const remaining = t.endDate - Date.now(); const expired = remaining < 0; const soon = !expired && remaining < 3 * 86400000; return (
+          <div key={t.id} className={`p-3 rounded-lg shadow-sm border flex gap-3 items-center ${t.returned ? 'bg-slate-100' : expired ? 'bg-red-50 border-red-300' : soon ? 'bg-amber-50 border-amber-300' : 'bg-white'}`}>
+            {b?.coverImg ? <img src={b.coverImg} className="w-12 h-16 object-cover rounded" /> : <div className="text-3xl">{b?.cover}</div>}
+            <div className="flex-1"><p className="font-bold">{b?.title}</p><p className="text-sm text-slate-600">{b?.author}</p><p className="text-xs text-slate-500">{fmt(t.startDate)} → {fmt(t.endDate)} • {t.totalPrice} ₽</p><p className="text-xs mt-1">{t.returned ? <span className="text-slate-600">✓ Возвращена</span> : expired ? <span className="text-red-700 font-medium">⚠ Просрочена!</span> : soon ? <span className="text-amber-700 font-medium">⏳ Скоро возврат</span> : <span className="text-green-700">активна</span>}</p></div>
+            {!t.returned && <button onClick={() => returnBook(t.id)} className="text-xs bg-slate-600 text-white px-2 py-1 rounded">Вернуть</button>}
+          </div>
+        ); })}</div>}
+      </section>
+    </div>
+  );
+}
+
+function AdminDashboardView() {
+  const { state } = useApp();
+  const totalRevenue = state.transactions.reduce((s, t) => s + t.totalPrice, 0);
+  const activeRentals = state.transactions.filter(t => t.type === 'rent' && !t.returned).length;
+  const purchases = state.transactions.filter(t => t.type === 'buy').length;
+  const topBooks = useMemo(() => {
+    const counts = {};
+    state.transactions.forEach(t => { counts[t.bookId] = (counts[t.bookId] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([id, n]) => ({ book: state.books.find(b => b.id === Number(id)), count: n }));
+  }, [state.transactions, state.books]);
+  return (
+    <div className="space-y-4">
+      <h2 className="text-xl font-bold">📊 Дашборд администратора</h2>
+      <div className="grid md:grid-cols-4 gap-3">
+        <div className="bg-emerald-50 p-4 rounded-lg border border-emerald-200"><p className="text-2xl font-bold text-emerald-700">{totalRevenue.toLocaleString('ru-RU')} ₽</p><p className="text-sm text-emerald-600">Выручка</p></div>
+        <div className="bg-blue-50 p-4 rounded-lg border border-blue-200"><p className="text-2xl font-bold text-blue-700">{purchases}</p><p className="text-sm text-blue-600">Покупок</p></div>
+        <div className="bg-amber-50 p-4 rounded-lg border border-amber-200"><p className="text-2xl font-bold text-amber-700">{activeRentals}</p><p className="text-sm text-amber-600">Активных аренд</p></div>
+        <div className="bg-slate-50 p-4 rounded-lg border"><p className="text-2xl font-bold text-slate-700">{state.books.length}</p><p className="text-sm text-slate-600">Книг в каталоге</p></div>
+      </div>
+      <div className="bg-white p-4 rounded-lg shadow-sm border">
+        <h3 className="font-bold mb-2">🏆 ТОП-5 книг по продажам/арендам</h3>
+        {topBooks.length === 0 ? <p className="text-sm text-slate-500">Транзакций пока нет</p> : topBooks.map(({ book, count }, i) => (
+          <div key={book?.id} className="flex justify-between py-1 border-b last:border-0">
+            <span><span className="text-amber-600 font-bold mr-2">#{i+1}</span>{book?.title}</span>
+            <span className="text-sm text-slate-500">{count} операций</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AdminBooksView() {
+  const { state, addBook, updateBook, deleteBook } = useApp();
+  const [editing, setEditing] = useState(null);
+  const empty = { title: '', author: '', year: 2024, category: '', price: 500, cover: '📘', coverImg: null, status: 'in_stock', available: true, description: '' };
+  const [form, setForm] = useState(empty);
+
+  const upload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const dataUrl = await compressImage(file);
+    setForm(f => ({ ...f, coverImg: dataUrl }));
+  };
+
+  const save = () => {
+    if (!form.title || !form.author) return alert('Заполните название и автора');
+    if (editing === 'new') addBook(form); else updateBook(editing, form);
+    setEditing(null);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-between items-center"><h2 className="text-xl font-bold">Управление каталогом</h2><button onClick={() => { setForm(empty); setEditing('new'); }} className="bg-emerald-600 text-white px-3 py-1.5 rounded-md text-sm">+ Добавить книгу</button></div>
+      {editing !== null && (
+        <div className="bg-white p-4 rounded-lg shadow-sm border space-y-2">
+          <h3 className="font-bold">{editing === 'new' ? 'Новая книга' : 'Редактирование'}</h3>
+          <div className="grid md:grid-cols-2 gap-2">
+            <input value={form.title} onChange={e => setForm({...form, title: e.target.value})} placeholder="Название" className="px-3 py-2 border rounded-md" />
+            <input value={form.author} onChange={e => setForm({...form, author: e.target.value})} placeholder="Автор" className="px-3 py-2 border rounded-md" />
+            <input type="number" value={form.year} onChange={e => setForm({...form, year: Number(e.target.value)})} placeholder="Год" className="px-3 py-2 border rounded-md" />
+            <input value={form.category} onChange={e => setForm({...form, category: e.target.value})} placeholder="Категория" className="px-3 py-2 border rounded-md" />
+            <input type="number" value={form.price} onChange={e => setForm({...form, price: Number(e.target.value)})} placeholder="Цена" className="px-3 py-2 border rounded-md" />
+            <input value={form.cover} onChange={e => setForm({...form, cover: e.target.value})} placeholder="Эмодзи (fallback)" className="px-3 py-2 border rounded-md" />
+            <select value={form.status} onChange={e => setForm({...form, status: e.target.value})} className="px-3 py-2 border rounded-md"><option value="in_stock">В каталоге</option><option value="archived">Архив</option></select>
+            <label className="flex items-center gap-2 px-3 py-2 border rounded-md"><input type="checkbox" checked={form.available} onChange={e => setForm({...form, available: e.target.checked})} />Доступна</label>
+          </div>
+          <textarea value={form.description} onChange={e => setForm({...form, description: e.target.value})} placeholder="Описание" rows={2} className="w-full px-3 py-2 border rounded-md" />
+          <div className="flex items-center gap-3"><label className="text-sm">Обложка:</label><input type="file" accept="image/*" onChange={upload} className="text-sm" />{form.coverImg && <img src={form.coverImg} className="w-12 h-16 object-cover rounded border" />}{form.coverImg && <button type="button" onClick={() => setForm({...form, coverImg: null})} className="text-xs text-red-600">убрать</button>}</div>
+          <div className="flex gap-2"><button onClick={save} className="bg-emerald-600 text-white px-3 py-1.5 rounded-md text-sm">Сохранить</button><button onClick={() => setEditing(null)} className="bg-slate-200 px-3 py-1.5 rounded-md text-sm">Отмена</button></div>
+        </div>
+      )}
+      <div className="bg-white rounded-lg shadow-sm border overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-100 text-left"><tr><th className="p-2">Книга</th><th className="p-2">Автор</th><th className="p-2">Год</th><th className="p-2">Категория</th><th className="p-2">Цена</th><th className="p-2">Статус</th><th className="p-2">Дост.</th><th className="p-2"></th></tr></thead>
+          <tbody>
+            {state.books.map(b => (
+              <tr key={b.id} className="border-t">
+                <td className="p-2 flex items-center gap-2">{b.coverImg ? <img src={b.coverImg} className="w-8 h-10 object-cover rounded" /> : <span className="text-2xl">{b.cover}</span>}{b.title}</td>
+                <td className="p-2">{b.author}</td>
+                <td className="p-2">{b.year}</td>
+                <td className="p-2">{b.category}</td>
+                <td className="p-2">{b.price} ₽</td>
+                <td className="p-2"><span className={`text-xs px-2 py-0.5 rounded ${b.status === 'in_stock' ? 'bg-green-100 text-green-700' : 'bg-slate-200'}`}>{b.status === 'in_stock' ? 'в каталоге' : 'архив'}</span></td>
+                <td className="p-2">{b.available ? '✓' : '✗'}</td>
+                <td className="p-2 text-right"><button onClick={() => { setForm({...b}); setEditing(b.id); }} className="text-emerald-700 hover:underline mr-2">изм.</button><button onClick={() => { if (confirm('Удалить?')) deleteBook(b.id); }} className="text-red-600 hover:underline">удал.</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function AdminRentalsView() {
+  const { state } = useApp();
+  const rentals = state.transactions.filter(t => t.type === 'rent');
+  const now = Date.now();
+  const fmt = (ts) => new Date(ts).toLocaleDateString('ru-RU');
+  const soon = rentals.filter(t => !t.returned && t.endDate - now < 3 * 86400000 && t.endDate > now);
+  const expired = rentals.filter(t => !t.returned && t.endDate < now);
+  return (
+    <div className="space-y-4">
+      <h2 className="text-xl font-bold">Контроль аренд</h2>
+      {soon.length > 0 && <div className="bg-amber-50 border border-amber-300 p-3 rounded-lg"><p className="font-bold text-amber-800">⏳ Скоро возврат ({soon.length}) — пользователям отправлены автоматические напоминания</p>{soon.map(t => { const b = state.books.find(b => b.id === t.bookId); const u = state.users.find(u => u.id === t.userId); return <p key={t.id} className="text-sm text-amber-900">@{u?.username} → «{b?.title}» до {fmt(t.endDate)}</p>; })}</div>}
+      {expired.length > 0 && <div className="bg-red-50 border border-red-300 p-3 rounded-lg"><p className="font-bold text-red-800">⚠ Просрочены ({expired.length})</p>{expired.map(t => { const b = state.books.find(b => b.id === t.bookId); const u = state.users.find(u => u.id === t.userId); return <p key={t.id} className="text-sm text-red-900">@{u?.username} → «{b?.title}» — должна была быть возвращена {fmt(t.endDate)}</p>; })}</div>}
+      <div className="bg-white rounded-lg shadow-sm border overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-100 text-left"><tr><th className="p-2">Пользователь</th><th className="p-2">Книга</th><th className="p-2">Период</th><th className="p-2">Цена</th><th className="p-2">Статус</th></tr></thead>
+          <tbody>
+            {rentals.map(t => { const b = state.books.find(b => b.id === t.bookId); const u = state.users.find(u => u.id === t.userId); const e = !t.returned && t.endDate < now; return (
+              <tr key={t.id} className="border-t"><td className="p-2">@{u?.username}</td><td className="p-2">{b?.title}</td><td className="p-2">{fmt(t.startDate)} → {fmt(t.endDate)}</td><td className="p-2">{t.totalPrice} ₽</td><td className="p-2">{t.returned ? <span className="text-slate-600">✓ возвращена</span> : e ? <span className="text-red-700">⚠ просрочена</span> : <span className="text-green-700">активна</span>}</td></tr>
+            ); })}
+          </tbody>
+        </table>
+        {rentals.length === 0 && <p className="text-center text-slate-500 py-4">Аренд пока нет</p>}
+      </div>
+    </div>
+  );
+}
+
+function NotifView() {
+  const { state, currentUser, markNotifRead } = useApp();
+  const mine = state.notifications.filter(n => n.userId === currentUser.id).sort((a,b) => b.createdAt - a.createdAt);
+  if (mine.length === 0) return <p className="text-center text-slate-500 py-12">Уведомлений нет</p>;
+  return <div className="space-y-2"><h2 className="text-xl font-bold">Уведомления</h2>{mine.map(n => (
+    <div key={n.id} className={`p-3 rounded-lg border ${n.read ? 'bg-slate-50' : n.type === 'expired' ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-300'}`}>
+      <p className="text-sm">{n.message}</p>
+      <p className="text-xs text-slate-500 mt-1">{new Date(n.createdAt).toLocaleString('ru-RU')}</p>
+      {!n.read && <button onClick={() => markNotifRead(n.id)} className="text-xs text-emerald-700 mt-1 hover:underline">Отметить прочитанным</button>}
+    </div>
+  ))}</div>;
+}
+
+function App() {
+  const [tab, setTab] = useState('catalog');
+  const { currentUser, resetDemo } = useApp();
+  return <>
+    <Header tab={tab} setTab={setTab} />
+    <main className="max-w-6xl mx-auto px-4 py-6">
+      {tab === 'auth' && !currentUser && <AuthScreen onDone={() => setTab('catalog')} />}
+      {tab === 'catalog' && <CatalogView />}
+      {tab === 'my' && currentUser && <MyLibraryView />}
+      {tab === 'admin-dashboard' && currentUser?.role === 'admin' && <AdminDashboardView />}
+      {tab === 'admin-books' && currentUser?.role === 'admin' && <AdminBooksView />}
+      {tab === 'admin-rentals' && currentUser?.role === 'admin' && <AdminRentalsView />}
+      {tab === 'notif' && currentUser && <NotifView />}
+    </main>
+    <footer className="text-center text-xs text-slate-400 py-6">Synergy Bookstore — учебный проект • <button onClick={() => { if (confirm('Сбросить демо?')) resetDemo(); }} className="underline">Сброс</button></footer>
+  </>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<AppProvider><App /></AppProvider>);
+</script>
+</body>
+</html>
